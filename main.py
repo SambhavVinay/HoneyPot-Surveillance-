@@ -1,139 +1,120 @@
 import os
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+import whisper # You'll need: pip install openai-whisper
+from fastapi import FastAPI, HTTPException, UploadFile, File
 from crewai import Agent, Task, Crew, Process
 from crewai.tools import tool
 
-# 1. Setup FastAPI
-app = FastAPI(title="Phishing Detection API")
+app = FastAPI(title="Voice Scam Detection API")
 
-# 2. Define Request Model
-class EmailInput(BaseModel):
-    email_text: str
-
-# 3. Environment & Config
+# 1. Configuration
 os.environ["MISTRAL_API_KEY"] = "2smqxCpjSh1yZeAjZUs4yUafsIJbwmbl"
 my_llm = "mistral/open-mistral-7b"
 MY_EMAIL = "teamdopameme@gmail.com"
 MY_APP_PASSWORD = "obqdsxzodjcirwhd"
 
-# 4. Tool with Scope-Safe Imports
+# Load the STT model once at startup
+stt_model = whisper.load_model("base") 
+
+# 2. Email Tool (Same as before)
 @tool("send_email_report")
 def send_email_report(content: str):
-    """Sends the phishing analysis report via email."""
+    """Sends the scam analysis report via email."""
     import smtplib
     from email.message import EmailMessage
-    
     msg = EmailMessage()
     msg.set_content(content)
-    msg['Subject'] = '🚨 Phishing Analysis Report'
+    msg['Subject'] = '🚨 Voice Scam Analysis Report'
     msg['From'] = MY_EMAIL
     msg['To'] = MY_EMAIL
-
     try:
         with smtplib.SMTP_SSL('smtp.gmail.com', 465) as smtp:
             smtp.login(MY_EMAIL, MY_APP_PASSWORD)
             smtp.send_message(msg)
         return "Email sent successfully!"
     except Exception as e:
-        return f"Failed to send email: {e}"
+        return f"Failed: {e}"
 
-# 5. Define Agents (Global or inside endpoint)
-content_analyst = Agent(
-    role="Email Content Analyst",
-    goal="Identify psychological triggers in the email body.",
-    backstory="Expert in social engineering analysis.",
-    llm=my_llm,
-    verbose=True
-)
-
-link_inspector = Agent(
-    role="Link & URL Specialist",
-    goal="Extract and analyze all URLs in the email.",
-    backstory="Specialist in deceptive URL detection.",
+# 3. Agents (Tweaked for Voice Scam context)
+voice_analyst = Agent(
+    role="Voice Content Analyst",
+    goal="Identify verbal scam triggers like OTP requests, bank impersonation, or 'KYC' threats.",
+    backstory="You are an expert in vishing (voice phishing) tactics and social engineering.",
     llm=my_llm,
     verbose=True
 )
 
 verdict_officer = Agent(
     role="Cybersecurity Official",
-    goal="Provide a final 'PHISHING' or 'GENUINE' verdict.",
-    backstory="Final decision maker on security threats.",
-    llm=my_llm,
-    verbose=True
-)
-
-file_manager = Agent(
-    role="Report Formatter",
-    goal="Extract only the Verdict, High-Risk Links, and Action Steps.",
-    backstory="Administrative assistant specializing in technical documentation.",
+    goal="Provide a final 'SCAM' or 'GENUINE' verdict on the call transcript.",
+    backstory="Security specialist trained to spot fraudulent phone calls.",
     llm=my_llm,
     verbose=True
 )
 
 email_agent = Agent(
-    role="Cybersecurity Communicator",
-    goal="Send the final report via email.",
-    backstory="Stakeholder management and alert delivery specialist.",
+    role="Alert Communicator",
+    goal="Send the report to teamdopameme@gmail.com.",
+    backstory="Alert delivery specialist.",
     llm=my_llm,
     tools=[send_email_report],
     verbose=True
 )
 
-# 6. API Endpoint
-@app.post("/detect-phishing")
-async def detect_phishing(input_data: EmailInput):
-    try:
-        
-        # Define Tasks inside the route to use the dynamic input
-        analysis_task = Task(
-            description=f"Review the email content: \n\n {input_data.email_text} \n\n Look for urgency and threats.",
-            agent=content_analyst,
-            expected_output="Summary of red flags."
-        )
+@app.get("/")
+async def health():
+    return {"message":"backend of crew ai working and alive."}
+# 4. API Endpoint for Audio
+@app.post("/analyze-call")
+async def analyze_call(file: UploadFile = File(...)):
+    # Save temp audio file
+    temp_filename = f"temp_{file.filename}"
+    with open(temp_filename, "wb") as buffer:
+        buffer.write(await file.read())
 
-        link_task = Task(
-            description=f"Extract all links from: \n\n {input_data.email_text}",
-            agent=link_inspector,
-            expected_output="Risk assessment of URLs.",
-            async_execution=True  # <--- This runs at the same time as analysis_task
+    try:
+        # Step 1: Transcribe Audio to Text
+        print("Transcribing audio...")
+        result = stt_model.transcribe(temp_filename)
+        transcript = result['text']
+        
+        # Step 2: Kickoff the Crew with the transcript
+        analysis_task = Task(
+            description=f"Analyze this call transcript for scam indicators: \n\n {transcript}",
+            agent=voice_analyst,
+            expected_output="A summary of suspicious verbal cues."
         )
 
         verdict_task = Task(
-            description="Determine if this email is phishing based on previous findings.",
+            description="Give a SCAM/GENUINE verdict. Specifically look for requests for OTPs or urgent KYC.",
             agent=verdict_officer,
-            expected_output="Final Report: [Verdict: PHISHING/GENUINE]"
-        )
-
-        save_task = Task(
-            description="Summarize the final verdict into a concise 'Key Findings' format.",
-            agent=file_manager,
-            expected_output="Concise summary.",
-            output_file="api_phishing_summary.txt"
+            expected_output="Final Verdict Report."
         )
 
         email_task = Task(
-            description=f"Email the summary to {MY_EMAIL}.",
+            description="Email the final verdict to the user.",
             agent=email_agent,
-            expected_output="Confirmation email sent."
+            expected_output="Confirmation of email."
         )
 
-        # Create Crew
         crew = Crew(
-            agents=[content_analyst, link_inspector, verdict_officer, file_manager, email_agent],
-            tasks=[analysis_task, link_task, verdict_task, save_task, email_task],
+            agents=[voice_analyst, verdict_officer, email_agent],
+            tasks=[analysis_task, verdict_task, email_task],
             process=Process.sequential
         )
 
-        # Execute
-        result = crew.kickoff()
+        crew_output = crew.kickoff()
         
+        # Cleanup
+        os.remove(temp_filename)
+
         return {
             "status": "success",
-            "verdict": str(result)
+            "transcript": transcript,
+            "verdict": str(crew_output)
         }
 
     except Exception as e:
+        if os.path.exists(temp_filename): os.remove(temp_filename)
         raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
