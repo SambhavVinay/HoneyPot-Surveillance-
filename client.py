@@ -1,61 +1,44 @@
-import asyncio
-import websockets
-import pyaudio
-import msvcrt # Windows-specific library for keypresses
+import requests
+import uuid
+from datetime import datetime
 
-async def stream_mic():
-    uri = "ws://127.0.0.1:8080/ws/stream"
-    p = pyaudio.PyAudio()
+API_URL = "http://127.0.0.1:8000/chat"
+API_KEY = "YOUR_SECRET_API_KEY"
+
+def start_chat():
+    session_id = f"user-{uuid.uuid4().hex[:6]}"
+    history = []
     
-    try:
-        # Change this line in client.py:
-        async with websockets.connect(uri, ping_interval=None, ping_timeout=None) as websocket:
-            print("\n--- VOICE SCAM DETECTION CLIENT ---")
-            
-            while True:
-                print("\nOptions: [y] Start Recording | [q] Quit")
-                # Wait for initial input
-                cmd = input(">> ").lower()
-                
-                if cmd == 'q': 
-                    break
-                if cmd != 'y': 
-                    continue
+    print(f"--- Conversation Started (ID: {session_id}) ---")
+    print("Test with a 'Hello' first to see if it still thinks it's a scam.")
 
-                stream = p.open(format=pyaudio.paInt16, channels=1, rate=16000, 
-                                input=True, frames_per_buffer=8000)
-                
-                print("🔴 RECORDING... Press 'n' to stop and analyze.")
-                frames = []
-                
-                while True:
-                    # Read audio data
-                    data = stream.read(8000, exception_on_overflow=False)
-                    frames.append(data)
-                    
-                    # WINDOWS FIX: Check if a key is pressed without blocking
-                    if msvcrt.kbhit():
-                        key = msvcrt.getch().decode('utf-8').lower()
-                        if key == 'n':
-                            break
+    while True:
+        text = input("\nMe: ").strip()
+        if text.lower() in ['q', 'exit']: break
+        if not text: continue
 
-                print("🛑 STOPPED. Sending to agents...")
-                stream.stop_stream()
-                stream.close()
+        payload = {
+            "sessionId": session_id,
+            "message": {
+                "sender": "scammer",
+                "text": text,
+                "timestamp": datetime.now().isoformat()
+            },
+            "conversationHistory": history
+        }
 
-                # Send the complete audio buffer
-                await websocket.send(b''.join(frames))
+        try:
+            response = requests.post(API_URL, json=payload, headers={"x-api-key": API_KEY})
+            if response.status_code == 200:
+                reply = response.json().get("reply")
+                print(f"Sambhav (Agent): {reply}")
                 
-                # Receive and print the verdict
-                print("⏳ Agents are analyzing...")
-                response = await websocket.recv()
-                print(f"\n📢 VERDICT RECEIVED:\n{response}")
-
-    except Exception as e:
-        print(f"Error: {e}")
-    finally:
-        p.terminate()
-        print("Resources released.")
+                history.append(payload["message"])
+                history.append({"sender": "user", "text": reply, "timestamp": datetime.now().isoformat()})
+            else:
+                print(f"Server Error: {response.status_code}")
+        except Exception as e:
+            print(f"Connection failed: {e}")
 
 if __name__ == "__main__":
-    asyncio.run(stream_mic())
+    start_chat()
