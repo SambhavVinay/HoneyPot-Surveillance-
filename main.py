@@ -1,23 +1,31 @@
 import os
 import json
-from fastapi import FastAPI, Header, HTTPException
-from pydantic import BaseModel
+import re
+import time
+import requests
+import uvicorn
 from typing import List, Optional, Dict
-from crewai import Agent, Task, Crew
+from fastapi import FastAPI, Header, HTTPException, BackgroundTasks
+from pydantic import BaseModel
+from crewai import Agent, Task, Crew, Process
 
-app = FastAPI(title="Honeypot: Realistic Human Agent")
+# --- 1. CONFIGURATION ---
+app = FastAPI(title="Honeypot: Evaluation-Ready System")
 
-# Configuration
-os.environ["MISTRAL_API_KEY"] = "2smqxCpjSh1yZeAjZUs4yUafsIJbwmbl"
+AUTH_KEY = 'Ascenders'
 MY_LLM = "mistral/open-mistral-7b"
-AUTH_KEY = "YOUR_SECRET_API_KEY"
+os.environ["MISTRAL_API_KEY"] = "2smqxCpjSh1yZeAjZUs4yUafsIJbwmbl"
 
+# In-memory session storage
 sessions_db: Dict[str, dict] = {}
+# Global log to store full conversation history for saving
+history_logs: Dict[str, List[dict]] = {}
 
+# --- 2. DATA MODELS ---
 class Message(BaseModel):
     sender: str
     text: str
-    timestamp: str
+    timestamp: int
 
 class ScamRequest(BaseModel):
     sessionId: str
@@ -25,91 +33,153 @@ class ScamRequest(BaseModel):
     conversationHistory: List[Message]
     metadata: Optional[dict] = None
 
-# --- Improved Human-Like Agent ---
-honeypot_agent = Agent(
-    role="Sambhav, a Busy Freelancer",
-    goal="Distinguish between genuine work queries and scams while staying in character.",
-    backstory="""You are Sambhav, a developer working from home. You're friendly but 
-    brief because you're coding. You talk like a real person: use lowercase sometimes, 
-    keep sentences short, and use '?' instead of formal 'Please clarify.'
-    
-    If someone says 'Hi', don't call it a scam. Just say 'Hey, who's this?'. 
-    Only flag it as a scam IF they ask for money, OTPs, UPI IDs, or send suspicious links.
-    Until then, just be a normal, slightly distracted guy.""",
+# --- 3. AGENT DEFINITIONS ---
+target_agent = Agent(
+    role="Sambhav (Honeypot Persona)",
+    goal="Keep scammers talking and ask investigative questions to extract data.",
+    backstory=(
+        "You are Sambhav. Use casual Indian slang ('bro', 'ya'). "
+        "Your goal is to prolong the chat. If they mention a bank, ask for the branch. "
+        "If they send a link, ask for a screenshot or their email to 'verify'. "
+        "Always try to elicit phone numbers, UPI IDs, or account details. "
+        "Keep replies under 2 lines."
+    ),
     llm=MY_LLM,
-    allow_delegation=False,
-    verbose=False
+    allow_delegation=False
 )
 
-def save_intel_to_file(session_id: str):
+detector_agent = Agent(
+    role="Fraud Auditor",
+    goal="Identify if the interaction is a scam.",
+    backstory="Output ONLY 'True' if suspicious, otherwise 'False'.",
+    llm=MY_LLM,
+    allow_delegation=False
+)
+
+analyst_agent = Agent(
+    role="Intelligence Extractor",
+    goal="Extract technical indicators into structured JSON.",
+    backstory=(
+        "Extract: phoneNumbers, bankAccounts, upiIds, phishingLinks, emailAddresses. "
+        "Format as valid JSON only."
+    ),
+    llm=MY_LLM,
+    allow_delegation=False
+)
+
+# --- 4. CORE UTILITIES ---
+
+def trigger_final_reporting(session_id: str):
     data = sessions_db.get(session_id)
     if not data: return
-    
-    final_report = {
+    duration = int(time.time() - data["start_time"])
+    payload = {
         "sessionId": session_id,
         "scamDetected": data["scamDetected"],
-        "totalMessagesExchanged": data["count"],
-        "extractedIntelligence": data["intel"],
-        "agentNotes": "Human-like engagement completed."
+        "totalMessagesExchanged": data["real_count"],
+        "engagementDurationSeconds": duration,
+        "extractedIntelligence": {
+            "phoneNumbers": list(data["intel"]["phoneNumbers"]),
+            "bankAccounts": list(data["intel"]["bankAccounts"]),
+            "upiIds": list(data["intel"]["upiIds"]),
+            "phishingLinks": list(data["intel"]["phishingLinks"]),
+            "emailAddresses": list(data["intel"]["emailAddresses"])
+        },
+        "agentNotes": f"Detected scam. Duration: {duration}s. Tactics: Investigation & baiting."
     }
-    with open("hackathon_report.txt", "a") as f:
-        f.write(json.dumps(final_report, indent=4) + "\n" + "="*50 + "\n")
+    try:
+        requests.post("https://hackathon.guvi.in/api/updateHoneyPotFinalResult", json=payload, timeout=10)
+    except Exception as e:
+        print(f"❌ Reporting failed: {e}")
+
+def parse_intel_json(raw_output: str, session_id: str):
+    match = re.search(r'\{.*\}', raw_output, re.DOTALL)
+    if match:
+        try:
+            json_data = json.loads(match.group())
+            intel_db = sessions_db[session_id]["intel"]
+            for field in ["phoneNumbers", "bankAccounts", "upiIds", "phishingLinks", "emailAddresses"]:
+                val = json_data.get(field) or json_data.get(field[:-1])
+                if val:
+                    if isinstance(val, list):
+                        intel_db[field].update([str(v) for v in val])
+                    elif str(val).lower() != "null":
+                        intel_db[field].add(str(val))
+        except: pass
+
+# --- 5. API ENDPOINTS ---
 
 @app.post("/chat")
-async def handle_scam_message(request: ScamRequest, x_api_key: str = Header(None)):
+async def handle_scam_message(
+    request: ScamRequest, 
+    background_tasks: BackgroundTasks, 
+    x_api_key: str = Header(None)
+):
     if x_api_key != AUTH_KEY:
         raise HTTPException(status_code=401, detail="Invalid API Key")
 
     s_id = request.sessionId
+
     if s_id not in sessions_db:
         sessions_db[s_id] = {
-            "count": 0, "scamDetected": False,
-            "intel": {"bankAccounts": [], "upiIds": [], "phishingLinks": [], "phoneNumbers": []}
+            "start_time": time.time(),
+            "real_count": 0,
+            "scamDetected": False,
+            "reported": False,
+            "intel": {
+                "bankAccounts": set(), "upiIds": set(), "phishingLinks": set(), 
+                "phoneNumbers": set(), "emailAddresses": set()
+            }
         }
-    
-    sessions_db[s_id]["count"] += 1
+        history_logs[s_id] = []
 
-    task = Task(
-        description=f"""
-        MESSAGE: '{request.message.text}'
-        HISTORY: {request.conversationHistory}
+    # Log incoming message
+    history_logs[s_id].append(request.message.dict())
 
-        INSTRUCTIONS:
-        1. Is this DEFINITELY a scam? (e.g., asking for payments, offering fake jobs). 
-           If it's just 'Hi' or 'Are you there?', is_scam is FALSE.
-        2. Respond like a real person. No 'As an AI' or 'I am a security bot'. 
-           Use phrases like 'sorry, who is this?', 'im a bit busy', or 'wait, why?'.
-        
-        Return ONLY valid JSON:
-        {{
-            "is_scam": true/false,
-            "reply": "your realistic response",
-            "found_intel": {{ "upi": "null", "link": "null" }}
-        }}
-        """,
-        agent=honeypot_agent,
-        expected_output="A JSON object."
-    )
+    sessions_db[s_id]["real_count"] = len(request.conversationHistory) + 1
+    history_context = "\n".join([f"{m.sender}: {m.text}" for m in request.conversationHistory[-4:]])
 
-    crew = Crew(agents=[honeypot_agent], tasks=[task])
+    t_detect = Task(description=f"Is this a scam? Text: {request.message.text}", agent=detector_agent, expected_output="True or False")
+    t_analyze = Task(description=f"Extract data from: {request.message.text}", agent=analyst_agent, expected_output="JSON with phoneNumbers, bankAccounts, upiIds, phishingLinks, emailAddresses")
+    t_chat = Task(description=f"Reply as Sambhav. History: {history_context}\nScammer: {request.message.text}", agent=target_agent, expected_output="1 line casual reply")
+
+    crew = Crew(agents=[detector_agent, analyst_agent, target_agent], tasks=[t_detect, t_analyze, t_chat], process=Process.sequential)
+
     try:
-        raw_result = crew.kickoff()
-        clean_res = str(raw_result).strip()
-        json_data = json.loads(clean_res[clean_res.find('{'):clean_res.rfind('}')+1])
-
-        if json_data.get("is_scam"):
+        crew.kickoff()
+        if "true" in str(t_detect.output).lower():
             sessions_db[s_id]["scamDetected"] = True
-            intel = json_data.get("found_intel", {})
-            if intel.get("upi") != "null": sessions_db[s_id]["intel"]["upiIds"].append(intel["upi"])
-            if intel.get("link") != "null": sessions_db[s_id]["intel"]["phishingLinks"].append(intel["link"])
 
-        if sessions_db[s_id]["count"] >= 3:
-            save_intel_to_file(s_id)
+        parse_intel_json(str(t_analyze.output), s_id)
+        chat_reply = str(t_chat.output).strip().replace('"', '')
 
-        return {"status": "success", "reply": json_data.get("reply")}
-    except:
-        return {"status": "success", "reply": "hey, sorry i'm in a meeting. who is this?"}
+        # Log our reply
+        history_logs[s_id].append({"sender": "user", "text": chat_reply, "timestamp": int(time.time()*1000)})
+
+        if (sessions_db[s_id]["real_count"] >= 8 or 
+           (sessions_db[s_id]["scamDetected"] and sessions_db[s_id]["real_count"] >= 6)):
+            if not sessions_db[s_id]["reported"]:
+                background_tasks.add_task(trigger_final_reporting, s_id)
+                sessions_db[s_id]["reported"] = True
+
+        return {"status": "success", "reply": chat_reply}
+
+    except Exception:
+        return {"status": "success", "reply": "hang on bro, getting a call. one sec."}
+
+@app.post("/save")
+async def save_conversation(sessionId: str):
+    """Saves the conversation history for a specific session to a .txt file."""
+    if sessionId not in history_logs:
+        raise HTTPException(status_code=404, detail="Session not found")
+    
+    filename = f"conversation_{sessionId}.txt"
+    try:
+        with open(filename, "w") as f:
+            json.dump(history_logs[sessionId], f, indent=4)
+        return {"status": "success", "message": f"Saved to {filename}"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=7860)
